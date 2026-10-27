@@ -1,0 +1,1201 @@
+<USER_REQUEST>
+################################################################################
+# AICTE INTEGRATED INSTITUTION COMPLAINT MONITORING AND STATUS DASHBOARD
+# MASTER IMPLEMENTATION PROMPT (SELF-CONTAINED)
+################################################################################
+
+You are the autonomous lead engineer for this project. Build a fully working,
+end-to-end prototype (frontend + backend + PostgreSQL) in the current workspace,
+verify it by actually running it, and report results honestly. This document is
+your complete specification. Where it is silent, use the simplest practical
+choice, record it in docs/DECISIONS.md, and continue. Do not stop at a plan, a
+wireframe, a static dashboard, a mock API, or a partial frontend.
+
+NON-NEGOTIABLE HONESTY RULES
+- Never state that a command, test, build, or workflow passed unless you ran it
+  in this session and saw it pass. Quote real output (counts, exit codes).
+- Never display a success message in the UI unless the backend call succeeded.
+- Never hardcode dashboard numbers, fake buttons, or decorative actions. Every
+  interactive control must call real logic or be removed.
+- Do not invent AICTE APIs, credentials, datasets, or real people/institutions.
+  All data is synthetic. Show a footer banner: "Prototype - synthetic data only".
+
+================================================================================
+## 1. PROJECT OBJECTIVE AND PROBLEM STATEMENT
+================================================================================
+AICTE receives complaints about technical education institutions from students,
+faculty, and other stakeholders. Different units handle them, notably the
+Regulation Bureau (RB) and the Public Grievance Redressal Cell (PGRC). Cases for
+the SAME institution may be handled by different units without visibility into
+each other, causing duplicate effort, overlapping actions, delays, and unclear
+ownership.
+
+Build a centralized, real-time dashboard where authorized officials can:
+- register and track complaints per institution,
+- see which bureau is primarily responsible and which bureaus participate,
+- detect potentially related complaints (explainable, deterministic, reviewable
+  by humans, never auto-merged),
+- keep full status/assignment/audit history,
+- receive notifications and see overdue/escalation indicators,
+- view analytics and export CSV reports, all derived from database records.
+
+The prototype runs locally, needs no external services, and uses synthetic data.
+
+================================================================================
+## 2. MANDATORY TECHNOLOGY STACK
+================================================================================
+Frontend: React 18, TypeScript (strict), Vite, Tailwind CSS, React Router v6,
+TanStack Query v5, React Hook Form, Zod (+ @hookform/resolvers), Recharts.
+Frontend tests: Vitest, React Testing Library, @testing-library/user-event,
+MSW (for API mocking in component tests only).
+
+Backend: Python 3.11+, FastAPI, SQLAlchemy 2.x (typed ORM), Alembic, Pydantic v2
+(+ pydantic-settings), psycopg 3 driver, argon2-cffi (password hashing),
+PyJWT (JWT), APScheduler (in-process job scheduling), uvicorn.
+Backend tests: pytest, pytest-cov, httpx (TestClient).
+
+Database: PostgreSQL 15+ (real PostgreSQL for dev AND tests; SQLite is NOT
+acceptable). Docker Compose provides the `db` service. If Docker is unavailable,
+README must give exact local-PostgreSQL commands as the fallback.
+
+Architecture style: modular monolith. NO microservices, Kubernetes, message
+brokers, Redis, Celery, paid services, or mandatory external AI/LLM APIs.
+Pin dependency versions only after confirming they install (use the lockfile /
+pip freeze); do not invent version numbers.
+
+Optional adapters (interfaces + console/no-op implementations only, not core):
+EmailNotifier, ExternalComplaintSource. Put them in backend/app/adapters/.
+They are OPTIONAL ENHANCEMENTS; skip if time-constrained.
+
+================================================================================
+## 3. REPOSITORY INSPECTION REQUIREMENTS (DO THIS FIRST)
+================================================================================
+Before modifying anything:
+1. List the workspace tree (depth 3). Read README, package.json, pyproject.toml,
+   requirements*.txt, docker-compose*, .env*, Makefile, and any docs.
+2. Run `git status` and `git log --oneline -10` if a git repo exists.
+3. Record tool versions: python --version, node --version, npm --version,
+   docker --version, docker compose version, psql --version (note any missing).
+4. Check whether ports 5432 (Postgres), 8000 (API), 5173 (Vite) are in use.
+5. Identify reusable existing work. PRESERVE it: adapt rather than overwrite. If
+   existing code conflicts with this spec, keep what works, migrate the rest, and
+   document the decision in docs/DECISIONS.md. Never delete user files without a
+   documented reason. Never overwrite an existing .env. No destructive git
+   commands. Local commits at milestones are allowed; never push.
+6. Create IMPLEMENTATION_PLAN.md at the repo root containing a checklist of every
+   phase in Section 21 plus the acceptance steps in Section 19. Update checkbox
+   state as you complete real, verified work. Do not tick unverified items.
+
+Target layout (adapt to existing structure only if justified):
+
+  /backend
+    app/
+      main.py                  app factory, middleware, routers, lifespan
+      cli.py                   `python -m app.cli seed|seed --reset|overdue-scan|create-admin`
+      core/ config.py security.py permissions.py errors.py clock.py logging.py
+      db/ base.py session.py
+      models/                  SQLAlchemy models (one module per aggregate)
+      schemas/                 Pydantic request/response models
+      services/                auth, users, institutions, complaints, assignments,
+                               status, relations(detection), notifications,
+                               audit, analytics, reports, visibility
+      api/v1/routers/          thin routers; NO business logic in routers
+      jobs/                    overdue_scan.py, scheduler.py
+      adapters/                (optional) interfaces + no-op implementations
+      seed/                    deterministic synthetic data generator
+    alembic/ + alembic.ini
+    tests/ (unit/, api/, e2e/)
+    requirements.txt, requirements-dev.txt, .env.example, pytest.ini
+  /frontend
+    src/ api/ auth/ components/ features/ pages/ routes/ lib/ test/
+    package.json (scripts: dev, build, preview, test, typecheck, lint)
+  /docker-compose.yml   (db service mandatory; app containers optional)
+  /docs/ ARCHITECTURE.md DECISIONS.md API.md TROUBLESHOOTING.md VERIFICATION_REPORT.md
+  /Makefile (convenience targets) and README.md (Windows PowerShell equivalents too)
+  /.env.example
+
+================================================================================
+## 4. SYSTEM ARCHITECTURE
+================================================================================
+  Browser (React SPA, Vite)
+        | HTTPS/JSON, Bearer JWT, base path /api/v1
+        v
+  FastAPI app  -- middleware: request-id, structured logging, CORS, security headers
+        |  routers (thin) -> services (business rules, authorization, audit)
+        |  -> SQLAlchemy session (one transaction per request)
+        v
+  PostgreSQL (schema via Alembic; triggers for append-only tables)
+        ^
+  APScheduler job (in the API process): overdue scan, idempotent
+
+Layering rules:
+- Routers validate input (Pydantic), resolve the current user, call ONE service
+  method, and return a schema. No SQL or business rules in routers.
+- Every service method that touches a complaint receives the current user and
+  calls the central authorization functions (core/permissions.py and
+  services/visibility.py). Authorization is enforced in the backend only; the
+  frontend merely hides controls based on server-provided `allowed_actions`.
+- Business write + status_history/assignment rows + notifications + audit record
+  are written in the SAME database transaction (all-or-nothing).
+- ACCESS_DENIED and failed-login audit rows are written in a SEPARATE session so
+  they persist even though the request transaction is rolled back.
+- Time: store timestamps as timestamptz (UTC). "Today" for dates, overdue and
+  aging is computed in APP_TIMEZONE (default Asia/Kolkata) via core/clock.py.
+  Clock is injectable so tests can fix "now".
+- Errors use one envelope:
+  {"error":{"code":"...","message":"...","details":{...},"request_id":"..."}}
+  Codes: UNAUTHENTICATED(401), INVALID_CREDENTIALS(401), ACCOUNT_LOCKED(423),
+  FORBIDDEN(403), NOT_FOUND(404), VALIDATION_ERROR(422),
+  INVALID_STATUS_TRANSITION(409), VERSION_CONFLICT(409), CONFLICT(409),
+  INTERNAL_ERROR(500; never leak stack traces).
+- Pagination: query `page` (default 1), `page_size` (default 20, max 100);
+  response {"items":[...],"total":n,"page":p,"page_size":s}.
+- OpenAPI docs at /docs and /openapi.json only when APP_ENV != production.
+
+================================================================================
+## 5. DATABASE SCHEMA, CONSTRAINTS, RELATIONSHIPS, MIGRATIONS
+================================================================================
+Use SQLAlchemy 2.x models + Alembic. Define a metadata naming convention so
+constraint names are stable. Primary keys: UUID (Python uuid4) except audit_logs
+(bigint identity). Strings for enumerations use VARCHAR + CHECK constraints (not
+PG enum types) for migration simplicity. All FKs are ON DELETE RESTRICT. There
+are NO hard-delete API endpoints: users/institutions are deactivated; complaints
+are never deleted.
+
+Migration 0001 creates the full schema, indexes, triggers, and inserts reference
+data (the two bureaus). Demo data is NOT in migrations (see Section 16).
+Downgrade must work: `alembic upgrade head`, `alembic downgrade base`,
+`alembic upgrade head` must all succeed (tested).
+
+TABLES
+
+bureaus
+  id uuid pk; code varchar(20) unique not null; name varchar(150) not null;
+  description text null; is_active bool default true; created_at timestamptz.
+  Reference rows: RB = "Regulation Bureau"; PGRC = "Public Grievance Redressal Cell".
+
+users
+  id uuid pk; email varchar(255) not null, UNIQUE on lower(email);
+  full_name varchar(150) not null; password_hash text not null;
+  role varchar(20) not null CHECK in (SYSTEM_ADMIN, SUPERVISOR, RB_OFFICIAL, PGRC_OFFICIAL);
+  bureau_id uuid null FK bureaus;
+  CHECK ((role in ('SYSTEM_ADMIN','SUPERVISOR') AND bureau_id IS NULL)
+      OR (role in ('RB_OFFICIAL','PGRC_OFFICIAL') AND bureau_id IS NOT NULL));
+  service layer additionally enforces RB_OFFICIAL->bureau RB, PGRC_OFFICIAL->bureau PGRC;
+  designation varchar(100) null; is_active bool default true;
+  failed_login_count int default 0; locked_until timestamptz null;
+  last_login_at timestamptz null; created_at, updated_at timestamptz.
+  DESIGN NOTE: roles are a fixed enum; the permission matrix lives in ONE code
+  module (core/permissions.py) and is covered by tests. No roles/permissions
+  tables (avoids dynamic-RBAC overengineering). Record this in DECISIONS.md.
+
+institutions
+  id uuid pk; code varchar(30) unique not null (synthetic format SYN-<ST>-<NNNN>);
+  name varchar(255) not null; name_normalized varchar(255) not null;
+  institution_type varchar(40) not null CHECK in (ENGINEERING, MANAGEMENT,
+    PHARMACY, ARCHITECTURE, POLYTECHNIC, OTHER);
+  state varchar(60) not null; district varchar(80) null; city varchar(80) null;
+  address text null; email varchar(255) null; phone varchar(30) null;
+  is_active bool default true; created_at, updated_at.
+  Indexes: (state), (name_normalized), (is_active).
+
+reference_counters
+  year int pk; last_value int not null. Reference numbers are generated by
+  `SELECT ... FOR UPDATE` on the year row (insert if missing) -> format
+  CMP-<YYYY>-<6-digit zero-padded>, e.g. CMP-2026-000001. Year = year of
+  received_date. (This is an internal prototype format, not an official AICTE number.)
+
+complaints
+  id uuid pk; reference_number varchar(30) unique not null;
+  institution_id uuid not null FK institutions;
+  title varchar(200) not null; description text not null;
+  category varchar(40) not null CHECK in (AFFILIATION_APPROVAL, FEES_REFUND,
+    FACULTY_ISSUES, INFRASTRUCTURE, ACADEMIC_MISCONDUCT, ADMISSION_IRREGULARITY,
+    FRAUD_FALSE_CLAIMS, STUDENT_WELFARE, OTHER);
+  priority varchar(10) not null CHECK in (LOW, MEDIUM, HIGH, CRITICAL);
+  status varchar(25) not null CHECK in (REGISTERED, UNDER_REVIEW, ACTION_INITIATED,
+    PENDING_INFORMATION, RESOLVED, CLOSED, REOPENED);
+  source_channel varchar(20) not null CHECK in (PORTAL, EMAIL, LETTER, PHONE, OTHER);
+  complainant_type varchar(20) not null CHECK in (STUDENT, FACULTY, PARENT,
+    STAKEHOLDER, ANONYMOUS, OTHER);
+  complainant_name varchar(150) null; complainant_contact varchar(150) null;
+  incident_reference varchar(100) null; incident_date date null;
+  received_date date not null; target_date date not null;
+  primary_bureau_id uuid not null FK bureaus;       -- denormalized from case_assignments
+  owner_user_id uuid null FK users;                 -- denormalized from case_assignments
+  created_by uuid not null FK users;
+  resolution_summary text null;
+  resolved_at timestamptz null; closed_at timestamptz null;
+  reopened_count int not null default 0;
+  escalation_level smallint not null default 0 CHECK in (0,1);
+  escalated_at timestamptz null; escalated_by uuid null FK users; escalation_reason text null;
+  keywords text[] not null default '{}';            -- normalized tokens, for detection/explanation
+  version int not null default 1;                   -- optimistic locking
+  created_at, updated_at timestamptz.
+  CHECKs: target_date >= received_date;
+          status='RESOLVED' -> resolution_summary not null and resolved_at not null;
+          status='CLOSED' -> closed_at not null.
+  Indexes: (institution_id, status); (primary_bureau_id, status);
+           (owner_user_id); (received_date); (category, institution_id);
+           partial (target_date) WHERE status NOT IN ('RESOLVED','CLOSED').
+  Denormalization contract: primary_bureau_id/owner_user_id MUST equal the active
+  PRIMARY row in case_assignments, updated in the same transaction by
+  services/assignments.py. A test asserts this invariant after every assignment op.
+
+case_assignments  (append-only history of who is responsible)
+  id uuid pk; complaint_id FK; bureau_id FK; assigned_user_id uuid null FK users;
+  role_in_case varchar(15) CHECK in (PRIMARY, PARTICIPATING);
+  is_active bool not null default true;
+  assigned_by uuid not null FK users; assigned_at timestamptz not null;
+  ended_at timestamptz null; ended_by uuid null FK users;
+  reason text null.
+  Unique partial index: (complaint_id) WHERE is_active AND role_in_case='PRIMARY'
+    -> exactly one active primary per complaint.
+  Unique partial index: (complaint_id, bureau_id) WHERE is_active
+    -> a bureau appears once as an active participant/primary.
+  CHECK (is_active OR ended_at IS NOT NULL).
+  Rows are never deleted; ending = is_active false + ended_at/ended_by.
+
+status_history  (APPEND-ONLY)
+  id uuid pk; complaint_id FK; from_status varchar(25) null; to_status varchar(25) not null;
+  changed_by uuid FK users; changed_at timestamptz not null; remark text null.
+  Index (complaint_id, changed_at). Trigger rejects UPDATE and DELETE.
+
+complaint_notes
+  id uuid pk; complaint_id FK; author_id FK users; bureau_id FK bureaus (author's
+  bureau at time of writing; null for supervisor); note_type varchar(20) CHECK in
+  (ACTION_NOTE, COORDINATION_NOTE, ESCALATION_NOTE); body text not null (3..2000);
+  created_at. Notes are immutable (no edit/delete endpoints).
+
+complaint_relations
+  id uuid pk; complaint_a_id FK; complaint_b_id FK;
+  CHECK (complaint_a_id < complaint_b_id)  -- canonical order; service normalizes pair;
+  UNIQUE (complaint_a_id, complaint_b_id);
+  status varchar(15) CHECK in (SUGGESTED, CONFIRMED, DISMISSED) default SUGGESTED;
+  relation_type varchar(20) null CHECK in (SAME_ISSUE, RELATED_ISSUE) -- required when CONFIRMED;
+  score smallint not null (0..100); confidence varchar(10) CHECK in (HIGH, MEDIUM);
+  explanation jsonb not null; algorithm_version varchar(10) not null;
+  detected_from_complaint_id uuid not null FK complaints; detected_at timestamptz not null;
+  reviewed_by uuid null FK users; reviewed_at timestamptz null; review_note text null.
+  Related complaints stay SEPARATE records with their own histories; relations
+  never merge, delete, or change status of either complaint.
+  Index (status), (complaint_a_id), (complaint_b_id).
+
+notifications
+  id uuid pk; user_id FK users; type varchar(30) not null; title varchar(200);
+  message text; complaint_id uuid null FK; institution_id uuid null FK;
+  is_read bool default false; read_at timestamptz null; created_at timestamptz;
+  dedupe_key varchar(200) null UNIQUE (prevents duplicate overdue alerts).
+  Index (user_id, is_read, created_at desc).
+
+audit_logs  (APPEND-ONLY)
+  id bigint identity pk; occurred_at timestamptz not null default now();
+  actor_user_id uuid null (no FK to allow system/failed-login actors);
+  actor_email varchar(255) null; actor_role varchar(20) null;
+  action varchar(50) not null; entity_type varchar(40) not null; entity_id varchar(64) null;
+  institution_id uuid null; complaint_id uuid null;
+  outcome varchar(10) not null CHECK in (SUCCESS, DENIED, FAILED);
+  before_data jsonb null; after_data jsonb null; details jsonb null;
+  ip_address varchar(64) null; request_id varchar(64) null.
+  Indexes: (occurred_at desc), (complaint_id), (institution_id), (actor_user_id), (action).
+  Never store password hashes, tokens, or raw passwords in before/after data.
+
+attachments: OPTIONAL ENHANCEMENT, not in migration 0001. If added later:
+  complaint_attachments(id, complaint_id, filename, content_type, size_bytes,
+  storage_path, uploaded_by, uploaded_at), local-disk storage under UPLOAD_DIR,
+  max 5 MB, allow-list pdf/png/jpg, random stored filenames.
+
+APPEND-ONLY ENFORCEMENT (mandatory, in migration 0001)
+- Trigger function raising an exception on UPDATE or DELETE for audit_logs and
+  status_history.
+- Statement-level TRUNCATE trigger on both tables that raises unless
+  current_setting('app.allow_truncate', true) = 'on'. Only the test reset helper
+  and `seed --reset` (refused when APP_ENV=production) set this via SET LOCAL.
+  Document honestly in DECISIONS.md that this protects against application bugs
+  and ordinary users, not against a database superuser.
+- Provide an OPTIONAL docker init script creating a restricted `aicte_app` role
+  with INSERT/SELECT only on audit_logs and status_history; document it as
+  optional hardening.
+
+Business predicates (single definition, used everywhere):
+- TERMINAL statuses: RESOLVED, CLOSED. OPEN = anything else (incl. REOPENED).
+- is_overdue = OPEN and target_date < today(APP_TIMEZONE).
+  (target_date == today is NOT overdue.)
+- days_overdue = today - target_date when overdue, else 0.
+- escalation_recommended = OPEN and (days_overdue >= 7 or
+  (priority = CRITICAL and days_overdue >= 1)).
+- age_days = today - received_date (open cases; used for aging buckets
+  0-7, 8-15, 16-30, 31-60, 61+).
+
+================================================================================
+## 6. AUTHENTICATION AND ROLE-BASED AUTHORIZATION
+================================================================================
+Authentication
+- POST /auth/login {email, password} -> {access_token, token_type:"bearer",
+  expires_in, user}. JWT HS256, claims: sub (user id), role, iat, exp.
+  Lifetime ACCESS_TOKEN_EXPIRE_MINUTES (default 60). No refresh token in the
+  prototype; on expiry the frontend redirects to login.
+- Passwords: argon2id; minimum 10 characters; (change-password enforces it).
+- Lockout: 5 consecutive failures -> locked_until = now + 15 min (423
+  ACCOUNT_LOCKED); successful login resets the counter. Login errors are generic
+  ("Invalid email or password"). Both outcomes are audited.
+- Every authenticated request loads the user from the DB; deactivated users are
+  rejected immediately (401) even with a valid token.
+- GET /auth/me, POST /auth/logout (audit only; client discards token),
+  POST /auth/change-password {current_password, new_password}.
+- Frontend stores the token in sessionStorage and attaches it to every request;
+  401 -> clear session, redirect to /login; 403 -> /unauthorized or inline
+  permission error. Record the XSS trade-off vs httpOnly cookies in DECISIONS.md.
+
+DEFINITIONS
+- "Participates" (FULL access): the user's bureau has an ACTIVE case_assignments
+  row (PRIMARY or PARTICIPATING) for the complaint.
+- "Primary bureau": user's bureau holds the active PRIMARY row.
+- SUMMARY access: any authenticated user may see summary-level fields of any
+  complaint: reference_number, institution, category, priority, status,
+  primary bureau, participating bureau codes, received_date, target_date,
+  is_overdue, days_overdue, escalation flags, updated_at. RESTRICTED fields
+  (title, description, complainant_*, incident_*, resolution_summary, notes,
+  status-history remarks, owner name, complaint-scoped audit trail) are returned
+  as null / omitted when access_level = SUMMARY. Rationale (DECISIONS.md): bureaus
+  must see that another bureau is handling the same institution to avoid
+  duplicated work, but not each other's sensitive case content.
+- Aggregate dashboard counts are visible to all roles (no complaint content).
+
+PERMISSION MATRIX (enforced in backend; Admin=SYSTEM_ADMIN, Sup=SUPERVISOR)
+Action                                   | Admin        | Sup  | RB_OFFICIAL            | PGRC_OFFICIAL
+-----------------------------------------|--------------|------|------------------------|----------------------
+View complaint list / summary (all)      | Y            | Y    | Y (summary)            | Y (summary)
+View complaint full detail               | Y read-only  | Y    | only if participates   | only if participates
+Create complaint                         | N            | Y    | Y                      | Y
+Edit complaint fields                    | N            | Y    | primary bureau only    | primary bureau only
+Add note                                 | N            | Y    | participates           | participates
+Add/remove participating bureau          | N            | Y    | primary bureau only    | primary bureau only
+Change owner (within primary bureau)     | N            | Y    | primary bureau only    | primary bureau only
+Transfer primary bureau                  | N            | Y    | N                      | N
+Change status (non-terminal moves)       | N            | Y    | primary bureau only    | primary bureau only
+Resolve                                  | N            | Y    | primary bureau only    | primary bureau only
+Close                                    | N            | Y    | N                      | N
+Reopen from RESOLVED                     | N            | Y    | primary bureau only    | primary bureau only
+Reopen from CLOSED                       | N            | Y    | N                      | N
+Escalate                                 | N            | Y    | primary bureau only    | primary bureau only
+Confirm / dismiss suggested relation     | N            | Y    | participates in either complaint | same
+Revert a reviewed relation               | N            | Y    | N                      | N
+View relation review queue               | Y            | Y    | items involving own bureau | same
+Institution timeline / coordination view| Y (full)     | Y full | Y (redacted by access_level) | same
+Manage institutions (create/edit/deactivate)| Y         | Y    | N                      | N
+Dashboard aggregates                     | Y            | Y    | Y                      | Y
+Export CSV reports                       | all scope    | all scope | own-bureau scope   | own-bureau scope
+Manage users                             | Y            | N    | N                      | N
+View global audit logs                   | Y            | Y read-only | N               | N
+Complaint-scoped audit trail             | Y            | Y    | full-access complaints | same
+Trigger overdue scan manually            | Y            | Y    | N                      | N
+Own notifications / change own password  | Y            | Y    | Y                      | Y
+
+Rules
+- Non-primary participating officials may read the complaint and add notes but
+  cannot change fields, status, ownership, or participants.
+- Official may assign owner only to an active user of their own bureau.
+- Official-created complaints default primary_bureau = creator's bureau and
+  owner = creator. Supervisors must supply primary_bureau_id (owner optional).
+  Officials cannot create a complaint with another bureau as primary.
+- Implement `compute_allowed_actions(user, complaint)` once and reuse it both to
+  authorize mutations and to return `allowed_actions` in complaint responses.
+- Unauthorized mutations return 403 with an audit row (outcome DENIED,
+  action ACCESS_DENIED, details = attempted operation). Detail endpoints that are
+  restricted (notes, complaint audit trail) return 403 for SUMMARY access.
+- A parametrized test iterates role x endpoint and asserts the matrix.
+
+================================================================================
+## 7. INSTITUTION MANAGEMENT
+================================================================================
+- CRUD without delete: create, read, update, deactivate/activate. Inactive
+  institutions cannot receive new complaints but remain visible with history.
+- Validation: code unique (format ^SYN-[A-Z]{2}-\d{4}$ for synthetic data; accept
+  any unique code in the API), name required, type from enum.
+- Listing: filters q (name/code), state, type, active, has_open_complaints,
+  has_overdue; sort by name, open count, overdue count, last activity. Each row
+  shows computed open_count, overdue_count, active_bureau_codes, last_activity_at
+  (aggregated in SQL, not in Python loops).
+- Institution profile (GET /institutions/{id}) returns details + KPI summary
+  (total, open, overdue, resolved, bureaus involved, pending relation reviews).
+- Consolidated timeline (GET /institutions/{id}/timeline): chronological merge
+  (newest first, paginated) of events across ALL complaints of the institution:
+  COMPLAINT_REGISTERED, STATUS_CHANGED, PRIMARY_ASSIGNED/TRANSFERRED,
+  PARTICIPANT_ADDED/REMOVED, OWNER_CHANGED, ESCALATED, NOTE_ADDED,
+  RELATION_CONFIRMED, RELATION_DISMISSED. Each event: timestamp, type, complaint
+  reference, bureau, actor display name, summary text. For SUMMARY access events,
+  titles, remarks, and note bodies are redacted (e.g. "A note was added by PGRC").
+- Coordination view (GET /institutions/{id}/coordination): per bureau, counts of
+  open complaints as primary and as participating, and the list of complaints
+  (access-level aware), plus a flag `multi_bureau_open` when at least two
+  different primary bureaus hold open complaints for this institution.
+- Audit: INSTITUTION_CREATED / UPDATED / DEACTIVATED with before/after.
+
+================================================================================
+## 8. COMPLAINT REGISTRATION AND TRACKING
+================================================================================
+Registration (POST /complaints)
+- Fields: institution_id (active), title (5-200), description (20-5000),
+  category, priority, source_channel, complainant_type, complainant_name?,
+  complainant_contact?, incident_reference?, incident_date? (not in future),
+  received_date (default today, not in future), target_date? (default =
+  received_date + {CRITICAL:7, HIGH:15, MEDIUM:30, LOW:45} days; must be >=
+  received_date), primary_bureau_id (required for Supervisor only), owner_user_id?.
+- Server actions in ONE transaction: generate reference number; insert complaint
+  with status REGISTERED and normalized keywords; insert PRIMARY assignment;
+  insert status_history (from null -> REGISTERED); run duplicate detection and
+  persist SUGGESTED relations; create notifications; write audit
+  COMPLAINT_CREATED. Response includes the complaint plus `related_candidates`.
+- Preview: POST /complaints/related-preview {institution_id, category, title,
+  description, incident_reference?, incident_date?, received_date?} returns
+  candidates WITHOUT persisting anything, so the create form can warn the user
+  before submit. Preview result is not authoritative; creation re-runs detection.
+
+Editing (PATCH /complaints/{id}) requires `version` (optimistic locking -> 409
+VERSION_CONFLICT on mismatch). Editable: title, description, category, priority,
+source_channel, complainant_*, incident_*, target_date. Changing target_date
+requires `target_date_change_reason` (stored in audit details). Editing a CLOSED
+complaint is rejected (must reopen first). Editing category/title/description/
+incident fields re-runs detection (adds new SUGGESTED relations only; never
+modifies reviewed ones). priority/received_date edits do not alter target_date
+automatically.
+
+Listing (GET /complaints): filters q (reference/title for FULL-access rows,
+reference only for SUMMARY rows), institution_id, status (multi), category,
+priority, primary_bureau_id, participating_bureau_id, owner_user_id,
+unassigned_owner (bool), overdue (bool), escalated (bool), received_from/to,
+scope=bureau|all (officials default `bureau` = complaints where their bureau
+participates; `all` returns all complaints with access_level per row; Supervisor/
+Admin default `all`), sort (received_date, target_date, updated_at, priority,
+days_overdue) + order. Rows carry access_level; restricted fields are null.
+
+Detail (GET /complaints/{id}): returns the complaint payload:
+  id, reference_number, institution{id,code,name}, title, description, category,
+  priority, status, source_channel, complainant_type, complainant_name,
+  complainant_contact, incident_reference, incident_date, received_date,
+  target_date, is_overdue, days_overdue, escalation_recommended, escalation_level,
+  escalation_reason, primary_bureau{id,code,name}, owner{id,full_name}|null,
+  participating_bureaus[{id,code,name}], resolution_summary, resolved_at,
+  closed_at, reopened_count, created_by{id,full_name}, created_at, updated_at,
+  version, access_level (FULL|SUMMARY), allowed_actions{can_edit, can_add_note,
+  can_manage_participants, can_change_owner, can_transfer_primary,
+  allowed_status_transitions[], can_escalate, can_review_relations}.
+Related data endpoints: notes, status history, assignments, relations, audit trail.
+Status history and assignment history are visible at SUMMARY level (remarks
+redacted); notes and audit trail are FULL-access only.
+
+Edge cases to handle explicitly: inactive institution; deactivated owner
+(deactivating a user clears owner_user_id on their OPEN complaints, writes
+audit rows, and notifies supervisors; primary bureau is unchanged);
+future dates; target before received; concurrent edits (409); empty search
+results; very long text (validation errors, not 500).
+
+================================================================================
+## 9. CROSS-BUREAU ASSIGNMENTS AND OWNERSHIP
+================================================================================
+Endpoints (all write to case_assignments, update denormalized columns in the
+same transaction, notify, audit):
+- POST /complaints/{id}/participants {bureau_id, reason?} - add participating
+  bureau. 409 if the bureau is already active on the case.
+- DELETE /complaints/{id}/participants/{bureau_id} {reason?} - ends the
+  participating row (is_active=false). Cannot remove the primary bureau.
+- POST /complaints/{id}/owner {user_id|null, reason?} - change owner within the
+  primary bureau (ends old PRIMARY row, inserts a new PRIMARY row for the same
+  bureau with the new assigned_user_id; history preserved).
+- POST /complaints/{id}/primary-transfer {bureau_id, owner_user_id?, reason (required),
+  keep_previous_as_participant (default true)} - Supervisor only. Ends the old
+  PRIMARY row, creates the new PRIMARY row, optionally adds the old bureau as
+  PARTICIPATING, updates complaints.primary_bureau_id/owner_user_id.
+- GET /complaints/{id}/assignments - full assignment history ordered by time.
+Invariants (tested): exactly one active PRIMARY row per complaint; complaints.
+primary_bureau_id/owner_user_id equal that row; no assignment row is ever
+deleted or edited except setting ended_at/ended_by/is_active.
+
+Auto-participation on relation confirmation (Section 10): confirming a relation
+adds each complaint's primary bureau as PARTICIPATING on the OTHER complaint (if
+not already active), with reason "Added on confirmation of related complaint
+relation <relation_id>". The confirm request includes
+`add_participating_bureaus` (default true) so the reviewer can opt out.
+
+================================================================================
+## 10. DUPLICATE AND RELATED COMPLAINT DETECTION
+================================================================================
+Deterministic, explainable, no external API. Implement as pure functions in
+services/relations/ (normalizer.py, scorer.py) plus a persistence service.
+ALGORITHM_VERSION = "1.0". Constants live in one config module and are unit-tested.
+
+Candidate selection: all other complaints with the SAME institution_id (any status,
+including RESOLVED/CLOSED; flag status in output). Complaints of other
+institutions are never candidates.
+
+Normalization:
+- Unicode NFKC, lowercase, replace non-alphanumerics with spaces, drop tokens
+  shorter than 3 chars, drop pure numbers, remove stopwords (standard English list
+  plus: institute, institution, college, university, complaint, complainant,
+  student, students, regarding, against, please), apply a simple deterministic
+  suffix stemmer (ies->y, sses->ss, then strip ing/ed/es/s/ly/ment when the
+  remaining stem has >= 4 chars). Text = title + " " + description.
+- Keep token multiset (for TF) and token set. Store the top 15 tokens by
+  frequency (ties alphabetical) in complaints.keywords.
+
+Score (integer 0-100) = sum of components:
+1. category_match: 25 if categories equal, else 0.
+2. text_similarity: round(40 * (0.5 * Jaccard(token sets) + 0.5 * cosine(
+   sublinear TF vectors using 1 + ln(tf)))). 
+3. domain_terms: 15 * min(1, shared_domain_terms / 3). DOMAIN_TERMS (stemmed)
+   include: fee, refund, tuition, hostel, scholarship, admission, cancel, seat,
+   capitation, faculty, salary, qualification, recruit, laboratory, lab,
+   infrastructure, library, building, approval, affiliation, extension,
+   accreditation, intake, fake, forged, certificate, degree, exam, examination,
+   result, harassment, ragging, safety, placement, bond, documents, original,
+   withheld, deposit.
+4. incident_reference: 10 if both incident_reference values are non-empty and equal
+   after trim+lowercase.
+5. date_proximity: using incident_date when both present, else received_date;
+   gap <= 7 days -> 10; <= 30 -> 6; <= 90 -> 3; else 0.
+Rules: suggest when score >= 40 AND (category_match OR text_similarity points
+>= 12 OR incident_reference match). An incident_reference match always yields a
+suggestion with score floored to 40. Confidence: HIGH if score >= 60 else MEDIUM.
+Return at most 10 candidates ordered by score desc, received_date desc, id.
+
+Explanation JSON (stored in complaint_relations.explanation and returned):
+  {algorithm_version, score, confidence,
+   components:[{name, points, max_points, detail}],
+   shared_keywords:[...up to 10], shared_domain_terms:[...],
+   category_match:bool, incident_reference_match:bool,
+   date_gap_days:int|null, candidate_status, candidate_primary_bureau}.
+The UI renders this as a human-readable "Why this was flagged" card. Shared
+keywords appear in both complaints, so showing them does not leak restricted text.
+
+Workflow
+- On create/material edit: persist a SUGGESTED relation per new candidate
+  (skip pairs that already have any relation row, so DISMISSED stays dismissed).
+  Notify owners (or primary-bureau officials if no owner) of both complaints:
+  type RELATED_SUGGESTED.
+- GET /complaints/{id}/relations (all relation rows involving the complaint, with
+  the other complaint at its access level) and GET /relations?status=SUGGESTED&
+  institution_id=... (review queue, scoped as in the matrix).
+- POST /complaints/{id}/detect-related re-runs detection idempotently.
+- POST /relations/{id}/confirm {relation_type: SAME_ISSUE|RELATED_ISSUE, note?,
+  add_participating_bureaus?} and POST /relations/{id}/dismiss {note (required)}.
+  Allowed from SUGGESTED only; a second review attempt returns 409.
+  POST /relations/{id}/revert {status: CONFIRMED|DISMISSED, note (required)} -
+  Supervisor only; flips a reviewed relation (does NOT auto-remove participants;
+  say so in the UI).
+- Never auto-merge, delete, close, or change status of any complaint based on
+  similarity. Relations are links only.
+- Audit: RELATION_SUGGESTED (system actor), RELATION_CONFIRMED, RELATION_DISMISSED,
+  RELATION_REVERTED.
+
+================================================================================
+## 11. STATUS LIFECYCLE AND AUDIT HISTORY
+================================================================================
+Statuses: REGISTERED, UNDER_REVIEW, ACTION_INITIATED, PENDING_INFORMATION,
+RESOLVED, CLOSED, REOPENED.
+
+Valid transitions (everything else -> 409 INVALID_STATUS_TRANSITION):
+  REGISTERED          -> UNDER_REVIEW
+  UNDER_REVIEW        -> ACTION_INITIATED | PENDING_INFORMATION | RESOLVED
+  ACTION_INITIATED    -> UNDER_REVIEW | PENDING_INFORMATION | RESOLVED
+  PENDING_INFORMATION -> UNDER_REVIEW | ACTION_INITIATED
+  RESOLVED            -> CLOSED (Supervisor only) | REOPENED
+  CLOSED              -> REOPENED (Supervisor only)
+  REOPENED            -> UNDER_REVIEW | ACTION_INITIATED | PENDING_INFORMATION | RESOLVED
+Invalid examples that MUST be tested: REGISTERED->RESOLVED, REGISTERED->CLOSED,
+UNDER_REVIEW->CLOSED, CLOSED->RESOLVED, PENDING_INFORMATION->RESOLVED,
+same-status transitions.
+
+POST /complaints/{id}/status {to_status, remark?, resolution_summary?,
+expected_status?, version?}
+- Locks the complaint row (SELECT ... FOR UPDATE), validates the transition and
+  role permission, applies side effects:
+  RESOLVED: requires resolution_summary (>=20 chars) and remark; sets resolved_at.
+  CLOSED: requires remark; sets closed_at.
+  REOPENED: requires remark (>=5); increments reopened_count; clears resolved_at/
+  closed_at; if target_date is past, requires a new target_date in the request.
+  PENDING_INFORMATION: requires remark.
+- If expected_status is supplied and differs from current -> 409 VERSION_CONFLICT.
+- Inserts status_history; bumps version; notifies; writes audit
+  COMPLAINT_STATUS_CHANGED with before/after.
+
+Escalation: POST /complaints/{id}/escalate {reason (required)} - allowed while
+OPEN and escalation_level = 0; sets escalation_level=1, escalated_at/by/reason,
+adds an ESCALATION_NOTE, notifies supervisors and the owner, audits
+COMPLAINT_ESCALATED. Supervisor may clear it via PATCH-like endpoint
+POST /complaints/{id}/clear-escalation {note}.
+
+Notes: POST/GET /complaints/{id}/notes (ACTION_NOTE, COORDINATION_NOTE).
+
+Audit actions (use exactly these names): AUTH_LOGIN_SUCCESS, AUTH_LOGIN_FAILED,
+AUTH_LOGOUT, AUTH_PASSWORD_CHANGED, USER_CREATED, USER_UPDATED, USER_DEACTIVATED,
+USER_ACTIVATED, USER_PASSWORD_RESET, INSTITUTION_CREATED, INSTITUTION_UPDATED,
+INSTITUTION_DEACTIVATED, INSTITUTION_ACTIVATED, COMPLAINT_CREATED, COMPLAINT_UPDATED,
+COMPLAINT_STATUS_CHANGED, COMPLAINT_NOTE_ADDED, COMPLAINT_ESCALATED,
+COMPLAINT_ESCALATION_CLEARED, ASSIGNMENT_PARTICIPANT_ADDED,
+ASSIGNMENT_PARTICIPANT_REMOVED, ASSIGNMENT_PRIMARY_TRANSFERRED,
+ASSIGNMENT_OWNER_CHANGED, RELATION_SUGGESTED, RELATION_CONFIRMED,
+RELATION_DISMISSED, RELATION_REVERTED, REPORT_EXPORTED, OVERDUE_SCAN_RUN,
+ACCESS_DENIED, SEED_RUN.
+Each audit row: actor, role, entity, complaint/institution ids, before/after,
+request_id, ip, outcome. GET /audit-logs (Admin, Supervisor) with filters actor,
+action, entity_type, complaint_id, institution_id, outcome, date range, paginated.
+GET /complaints/{id}/audit (FULL access) returns that complaint's audit rows.
+
+================================================================================
+## 12. NOTIFICATIONS AND OVERDUE MONITORING
+================================================================================
+Notification types and recipients (never notify the actor about their own action;
+only active users; one row per recipient):
+- COMPLAINT_ASSIGNED: new owner; if the primary bureau changed, all active
+  officials of the new primary bureau.
+- PARTICIPATION_ADDED: all active officials of the added bureau, plus owner.
+- OWNERSHIP_CHANGED: new owner and previous owner.
+- STATUS_CHANGED: owner, creator, all active officials of participating bureaus;
+  plus all Supervisors when the new status is RESOLVED, REOPENED, or CLOSED.
+- RELATED_SUGGESTED: owner (or primary-bureau officials if no owner) of both
+  complaints.
+- RELATION_CONFIRMED / RELATION_DISMISSED: owners of both complaints.
+- OVERDUE: owner (or primary-bureau officials if no owner) and all Supervisors.
+- ESCALATION_RECOMMENDED: all Supervisors.
+- ESCALATED: all Supervisors and the owner.
+Endpoints: GET /notifications?unread=&type=&page, GET /notifications/unread-count,
+POST /notifications/{id}/read, POST /notifications/read-all. Users can only
+read/modify their own notifications (others -> 404).
+
+Overdue scan (jobs/overdue_scan.py)
+- Finds OPEN complaints with target_date < today. Creates OVERDUE notifications
+  keyed by dedupe_key "OVERDUE:<complaint_id>:<target_date>:<user_id>", and
+  ESCALATION_RECOMMENDED keyed "ESCRECO:<complaint_id>:<target_date>:<user_id>"
+  when escalation_recommended is true. Re-running creates NO duplicates
+  (INSERT ... ON CONFLICT DO NOTHING). Writes one OVERDUE_SCAN_RUN audit row with
+  counts. If the target_date is extended, new dedupe keys apply naturally.
+- Triggered by APScheduler every OVERDUE_SCAN_INTERVAL_MINUTES (default 15) when
+  ENABLE_SCHEDULER=true, by `python -m app.cli overdue-scan`, by
+  POST /system/jobs/overdue-scan (Admin/Supervisor), and once at startup.
+- Overdue/escalation indicators are ALSO computed live at query time, so
+  correctness never depends on the job having run.
+- Frontend: top-bar bell with unread badge (poll every 30 s via TanStack Query),
+  /notifications page with mark-read, mark-all-read, filter, and deep links to
+  the complaint/institution.
+
+================================================================================
+## 13. DASHBOARD ANALYTICS AND REPORTING
+================================================================================
+All figures come from SQL aggregate queries over real tables (GROUP BY / COUNT /
+FILTER), never from hardcoded or client-side-invented data. Common filters:
+date_from, date_to (applied to received_date, inclusive), bureau_id (primary),
+institution_id, category, priority.
+
+Endpoints (all under /api/v1, all roles; aggregate-only):
+- GET /analytics/summary -> total, open, resolved, closed, overdue_open,
+  escalated_open, escalation_recommended_open, received_last_7_days,
+  institutions_with_open_cases, institutions_with_multi_bureau_open_cases,
+  confirmed_relations, pending_relation_reviews, unassigned_owner_open.
+- GET /analytics/status-distribution -> count per status (zero-filled for all 7).
+- GET /analytics/bureau-workload -> per bureau: open_as_primary,
+  open_as_participating, overdue_as_primary, resolved_in_range, avg_open_age_days.
+- GET /analytics/aging -> open complaints in buckets 0-7, 8-15, 16-30, 31-60, 61+.
+- GET /analytics/trend?granularity=month -> received vs resolved counts per month
+  (resolved by resolved_at).
+- GET /analytics/top-institutions?limit=10&metric=open|overdue.
+Reports (row-level, scoped by role: Admin/Supervisor all; officials only
+complaints where their bureau participates; JSON + CSV):
+- GET /reports/complaints, /reports/institution-wise, /reports/bureau-wise,
+  /reports/overdue, /reports/aging; each has GET .../export.csv with identical
+  filters. JSON and CSV for the same filters must have identical row sets.
+CSV requirements: UTF-8 with header row; stable column order; Content-Type
+text/csv; Content-Disposition attachment with timestamped filename; cells that
+begin with = + - @ are prefixed with a single quote (formula-injection guard);
+RESTRICTED columns blank for rows the user cannot fully access (not applicable to
+scoped exports, but implement defensively); an audit row REPORT_EXPORTED is written
+with the report name, filters, and row count.
+Overdue report columns: reference_number, institution_code, institution_name,
+category, priority, status, primary_bureau, owner, received_date, target_date,
+days_overdue, escalation_level, escalation_recommended.
+
+================================================================================
+## 14. FRONTEND PAGES, COMPONENTS, AND UI STANDARDS
+================================================================================
+Routes (React Router; guarded by auth; role guards are UX only):
+  /login                         Login (email/password, validation, lockout/invalid messages)
+  /                              Dashboard
+  /institutions                  Institution listing (filters, server pagination, sort)
+  /institutions/:id              Institution details, tabs: Overview | Complaints |
+                                 Consolidated Timeline | Bureau Coordination | Related Cases
+  /complaints                    Complaint listing (filters, scope toggle, CSV of current view via reports)
+  /complaints/new                Create complaint (live related-preview panel)
+  /complaints/:id                Tabs: Overview | Status & Actions | Coordination |
+                                 Related | Notes | History | Audit Trail
+  /relations                     Related-complaint review queue
+  /notifications                 Notifications
+  /reports                       Report picker, filters, table preview, CSV download
+  /admin/users                   User management (Admin)
+  /admin/audit-logs              Audit logs (Admin, Supervisor)
+  /unauthorized                  403 page
+  *                              404 page; global error boundary page
+
+Per-page wiring (every control calls a real endpoint):
+- Dashboard: KPI cards (/analytics/summary), status chart (/status-distribution),
+  bureau workload chart, aging chart, trend chart, top institutions, overdue
+  table (/reports/overdue preview), date/bureau filters.
+- Institution profile: KPI strip, timeline (infinite or paged), coordination panel
+  showing primary vs participating bureaus per complaint, pending suggestions.
+- Complaint detail Status & Actions: only renders actions present in
+  allowed_actions: change status (dialog with required remark/resolution
+  summary), edit, escalate, add note, add/remove participant, change owner,
+  transfer primary (Supervisor). Dialogs show server validation errors inline.
+- Related tab: each suggested relation shows score, confidence, explanation card
+  (components table, shared keywords), other complaint summary, and Confirm
+  (relation type + note + checkbox "Add the other complaint's bureau as a
+  participating bureau", checked by default) / Dismiss (note required) buttons;
+  reviewed relations show reviewer, time, note; Supervisors see Revert.
+- Create complaint form: React Hook Form + Zod mirroring backend rules; as the
+  user fills institution/category/title/description (debounced 600 ms, min 20
+  chars of description), call /complaints/related-preview and show candidates
+  with explanations as a non-blocking warning. After submit, show created
+  reference and any persisted suggestions with a link to review.
+- Reports: choose report, filters, preview table (server data), "Download CSV"
+  hitting the export endpoint with auth header and saving the blob.
+- Users (Admin): list, create, edit role/bureau/designation, activate/deactivate,
+  reset password (shows the temporary password once, never stored in logs).
+- Audit logs: filter + table with before/after JSON viewer.
+
+Shared components: AppShell (sidebar + top bar), role-aware nav, NotificationBell,
+DataTable (server pagination/sort, sticky header), FilterBar, StatusBadge,
+PriorityBadge, OverdueBadge, EscalationBadge, BureauChip, AccessLevelNotice
+("Summary view - you do not participate in this case"), Timeline,
+MatchExplanationCard, KpiCard, ChartCard (Recharts), ConfirmDialog, Toast,
+EmptyState, ErrorState (with Retry), LoadingSkeleton, FormField, PermissionGate.
+
+UI standards
+- Professional government-enterprise look: neutral background, white cards, deep
+  navy primary, restrained accent colors. Status colors always accompanied by
+  text labels (not color-only). WCAG AA contrast, visible focus rings, labeled
+  inputs, keyboard-operable dialogs/tables, aria-live for toasts.
+- Dates in en-IN format (DD MMM YYYY). Desktop-first (>=1024px), usable at 768px.
+- Each data view implements loading, empty, error(+retry), and success states.
+  Validation errors appear inline per field (map backend 422 details to fields).
+  Mutations show a success toast ONLY after the server confirms, then invalidate
+  relevant TanStack Query keys (complaint, complaint lists, institution profile/
+  timeline/coordination, analytics, notifications, relations).
+- 401 -> logout+redirect; 403 -> permission message/page; 409 -> conflict message
+  with "Reload latest" action; network failure -> ErrorState.
+- No dangerouslySetInnerHTML. No hardcoded statistics. No dead buttons.
+- Typed API client in src/api (fetch or axios wrapper) with a single error
+  normalizer matching the backend error envelope.
+
+================================================================================
+## 15. API CONTRACTS AND BACKEND SERVICES
+================================================================================
+Base path: /api/v1. JSON. Authorization: Bearer <JWT> on all but login and health.
+
+AUTH       POST /auth/login | POST /auth/logout | GET /auth/me | POST /auth/change-password
+USERS      GET /users (Admin; filters role, bureau, active, q) | POST /users |
+           GET /users/{id} | PATCH /users/{id} | POST /users/{id}/activate |
+           POST /users/{id}/deactivate | POST /users/{id}/reset-password
+           GET /users/assignable?bureau_id= (any official/supervisor; id, name, bureau only)
+BUREAUS    GET /bureaus
+INSTITUTIONS GET /institutions | POST /institutions | GET /institutions/{id} |
+           PATCH /institutions/{id} | POST /institutions/{id}/deactivate |
+           POST /institutions/{id}/activate | GET /institutions/{id}/timeline |
+           GET /institutions/{id}/coordination
+COMPLAINTS GET /complaints | POST /complaints | POST /complaints/related-preview |
+           GET /complaints/{id} | PATCH /complaints/{id} |
+           POST /complaints/{id}/status | POST /complaints/{id}/escalate |
+           POST /complaints/{id}/clear-escalation |
+           GET|POST /complaints/{id}/notes | GET /complaints/{id}/history |
+           GET /complaints/{id}/assignments | POST /complaints/{id}/participants |
+           DELETE /complaints/{id}/participants/{bureau_id} |
+           POST /complaints/{id}/owner | POST /complaints/{id}/primary-transfer |
+           GET /complaints/{id}/relations | POST /complaints/{id}/detect-related |
+           GET /complaints/{id}/audit
+RELATIONS  GET /relations | POST /relations/{id}/confirm | POST /relations/{id}/dismiss |
+           POST /relations/{id}/revert
+NOTIFICATIONS GET /notifications | GET /notifications/unread-count |
+           POST /notifications/{id}/read | POST /notifications/read-all
+ANALYTICS  GET /analytics/{summary|status-distribution|bureau-workload|aging|trend|top-institutions}
+REPORTS    GET /reports/{complaints|institution-wise|bureau-wise|overdue|aging} and
+           GET /reports/{name}/export.csv
+AUDIT      GET /audit-logs
+SYSTEM     GET /health (liveness, no auth) | GET /health/ready (DB reachable + alembic
+           revision == head) | POST /system/jobs/overdue-scan
+
+Response/validation rules: Pydantic v2 models for every request/response; no ORM
+objects leaked; extra fields forbidden on requests; strings trimmed; UUID path
+params validated. All list endpoints paginated. All mutating endpoints return the
+updated resource. Services are unit-testable without HTTP. SQL is parameterized
+(no string-built SQL). Document endpoints in docs/API.md (generated summary from
+openapi.json is acceptable).
+
+================================================================================
+## 16. SYNTHETIC SEED DATA AND DEMONSTRATION ACCOUNTS
+================================================================================
+`python -m app.cli seed` (idempotent: refuses if data exists unless `--reset`;
+`--reset` is refused when APP_ENV=production; reset truncates via the audited
+reset helper that sets app.allow_truncate). Deterministic (random seed 20260101).
+Seeding uses the same service layer with an injectable `as_of` clock so history,
+audit rows, and reference numbers are internally consistent. Dates are generated
+RELATIVE to today so overdue cases always exist. All names/emails/institutions
+are fictional; email domain @aicte-demo.example; institution codes SYN-XX-NNNN.
+Never use real institution names or real people.
+
+Demo accounts (password from DEMO_PASSWORD env, default "Demo@12345", for demo
+only; document that it must never be used outside local demo):
+  admin@aicte-demo.example         SYSTEM_ADMIN
+  supervisor@aicte-demo.example    SUPERVISOR
+  rb.official1@aicte-demo.example  RB_OFFICIAL   (bureau RB)
+  rb.official2@aicte-demo.example  RB_OFFICIAL   (bureau RB)
+  pgrc.official1@aicte-demo.example PGRC_OFFICIAL (bureau PGRC)
+  pgrc.official2@aicte-demo.example PGRC_OFFICIAL (bureau PGRC)
+Show these on the login page ONLY when APP_ENV=development (as a demo helper).
+
+Data volume: 25 institutions across >= 6 states and all institution types;
+~120 complaints spanning all statuses, categories, priorities; both bureaus as
+primary; ~30 with participating bureaus; >= 15 overdue OPEN complaints (some
+>= 7 days overdue, at least one CRITICAL overdue); >= 5 SUGGESTED, >= 4
+CONFIRMED, >= 3 DISMISSED relations produced via the real detection/review
+services; complete status_history for each complaint; notes on ~40 complaints;
+notifications for all users; realistic backdated timestamps.
+
+MANDATORY SCENARIO FIXTURE (used by Section 19; do not alter titles):
+Institution: code SYN-TN-0001, "Meridian Institute of Engineering and Technology"
+(ENGINEERING, Tamil Nadu). Seeded complaints at this institution:
+ (a) PRIMARY BUREAU RB, owner rb.official1, status UNDER_REVIEW, category
+     FEES_REFUND, priority HIGH, received 3 days ago, target date in the future
+     (received + 15 days), title "Fee refund not processed after admission
+     cancellation", description: "Student reports that the institution has not
+     refunded tuition and hostel fees after cancellation of admission within the
+     permitted period. Multiple written requests to the accounts office have
+     received no response."
+ (b) PRIMARY BUREAU RB, owner rb.official2, status ACTION_INITIATED, category
+     INFRASTRUCTURE, priority MEDIUM, received 40 days ago, target date 10 days
+     in the PAST (so it is overdue), title "Laboratory equipment shortage in
+     computer science department", description about outdated/insufficient lab
+     machines. (Negative control: must NOT be suggested as related to the fee
+     refund complaint; and must appear in the overdue report.)
+No PGRC complaint exists at this institution before the scenario runs.
+Seed must also include at least one other institution with a FEES_REFUND
+complaint (negative control: same category, different institution, never a
+candidate).
+
+================================================================================
+## 17. SECURITY REQUIREMENTS
+================================================================================
+- Backend-enforced authorization for every endpoint (Section 6); object-level
+  checks on every complaint/relation/notification access (no IDOR).
+- argon2id password hashing; lockout; generic login errors; token expiry;
+  immediate rejection of deactivated users.
+- SECRET_KEY must come from the environment; the app refuses to start with the
+  default/placeholder secret when APP_ENV=production.
+- CORS limited to FRONTEND_ORIGIN; security headers (X-Content-Type-Options,
+  X-Frame-Options DENY, Referrer-Policy, a restrictive CSP for the API).
+- Input validation everywhere via Pydantic; parameterized SQL only; length limits.
+- Never log passwords, tokens, hashes, or full complainant contact data; use
+  structured logs with request_id. Error responses never contain stack traces.
+- CSV formula-injection guard; React default escaping; no dangerouslySetInnerHTML.
+- Audit immutability enforced by DB triggers (Section 5).
+- Dependencies from official registries only; note `pip-audit`/`npm audit`
+  results in the report if you run them (do not claim a clean audit unless run).
+- Document honest limitations (sessionStorage token, no MFA, no rate limiting
+  beyond login lockout, synthetic data only) in docs/ARCHITECTURE.md.
+
+================================================================================
+## 18. AUTOMATED TESTS
+================================================================================
+Backend (pytest) against a REAL PostgreSQL test database (TEST_DATABASE_URL,
+default aicte_dashboard_test, created automatically if missing; schema built via
+`alembic upgrade head`; per-test reset via the audited truncate helper; fixtures
+for users per role, institutions, complaints, login helper, fixed clock).
+Required test modules and key assertions:
+- test_migrations: upgrade -> downgrade base -> upgrade succeeds; expected tables,
+  CHECKs, partial unique indexes, and triggers exist.
+- test_auth: login success/failure, lockout after 5 failures, locked message,
+  expired token, deactivated user rejected, change password, /auth/me.
+- test_permissions_matrix: parametrized role x endpoint x (primary/participant/
+  non-participant) asserting 200/403/401 per Section 6; unauthenticated -> 401.
+- test_users: admin-only management; role/bureau CHECK; deactivation clears
+  owner on open complaints and notifies supervisors.
+- test_institutions: CRUD, deactivate blocks new complaints, filters/aggregates.
+- test_complaints_crud: create (reference format/uniqueness under concurrent
+  creation), validation errors, default target dates, edit with version conflict,
+  restricted-field redaction for SUMMARY access, closed complaint edit rejected.
+- test_assignments: add/remove participant, owner change, primary transfer,
+  history preserved, exactly-one-active-primary invariant, denormalized columns
+  consistent after every operation.
+- test_status_transitions: every valid transition succeeds; every invalid pair
+  returns 409; required remarks/resolution summary; role limits (close/reopen
+  closed Supervisor-only); status_history row per transition; resolved_at/closed_at.
+- test_relation_detection: unit tests for normalizer, stemmer, each score
+  component, thresholds, ordering, determinism (same input -> same output),
+  negative controls (different category/institution), incident-reference floor.
+- test_relations_review: confirm/dismiss/revert rules, double-review 409,
+  dismissed pairs not re-suggested, auto-participation on confirm with opt-out,
+  complaints remain separate rows (no status/field changes).
+- test_audit_logs: every mutation writes the expected action; DENIED rows persist
+  for forbidden attempts; raw SQL UPDATE/DELETE on audit_logs and status_history
+  raise; TRUNCATE without the GUC raises; secrets never appear in audit data.
+- test_notifications: recipient rules per type, no self-notification, read/unread,
+  isolation between users.
+- test_overdue: boundary (target == today not overdue; yesterday overdue),
+  RESOLVED/CLOSED never overdue, escalation_recommended rules, scan idempotency
+  (second run creates zero new rows), scheduler-independent live indicators.
+- test_analytics: every endpoint's numbers equal independently computed counts
+  from raw queries on fixture data; date/bureau filters; zero-filled statuses;
+  numbers change after a status update.
+- test_reports_csv: headers/columns, row sets identical to JSON, scope for
+  officials, CSV injection guard, filename/content-type, REPORT_EXPORTED audit.
+- test_cross_bureau_workflow: RB case + PGRC case at one institution -> detection
+  -> confirm -> both bureaus participate -> timelines consolidated -> redaction
+  correct for each role.
+- tests/e2e/test_acceptance_scenario.py: the full Section 19 scenario, runnable
+  in-process (TestClient) by default or against a live server when E2E_BASE_URL
+  is set (httpx).
+Report coverage with pytest-cov (target >= 80% for app/services; report the real
+number, do not fabricate; coverage below target is a known limitation, not a lie).
+
+Frontend (Vitest + RTL + MSW): login form validation and error display; auth
+guard redirects; 401 handling; 403 -> unauthorized; PermissionGate/allowed_actions
+rendering; StatusBadge/OverdueBadge; DataTable loading/empty/error states;
+ComplaintForm Zod validation and server-error mapping; MatchExplanationCard
+rendering; related review dialog (confirm/dismiss payloads); dashboard renders
+values from mocked API (and shows ErrorState on failure); reports page triggers the
+CSV request. Also required: `npm run typecheck`, `npm run lint`, and
+`npm run build` must pass.
+
+OPTIONAL ENHANCEMENT: Playwright browser test of the scenario. If a browser tool
+is available in your environment, do at least a manual smoke test of the main
+pages and record screenshots/observations in docs/VERIFICATION_REPORT.md.
+
+================================================================================
+## 19. END-TO-END ACCEPTANCE SCENARIO (MANDATORY)
+================================================================================
+Implement as tests/e2e/test_acceptance_scenario.py and execute it. Use titles and
+institution code from Section 16; look complaints up by institution + title, never
+by hardcoded reference numbers. Record counts before changes where deltas are asserted.
+
+ 1. Login as rb.official1 -> 200, token issued, role RB_OFFICIAL, bureau RB.
+ 2. GET institution SYN-TN-0001 (via list filter q=SYN-TN-0001 then GET by id) ->
+    profile returns with open/overdue KPIs.
+ 3. GET /complaints?institution_id=...&scope=bureau -> contains complaint (a)
+    "Fee refund not processed after admission cancellation" with access_level FULL,
+    status UNDER_REVIEW, primary bureau RB.
+ 4. Login as pgrc.official1 (separate token). Confirm that fetching complaint (a)
+    returns access_level SUMMARY with title/description null, and that
+    GET /complaints/{a}/notes returns 403.
+ 5. As pgrc.official1, POST /complaints/related-preview with the PGRC input below
+    -> candidate (a) returned (preview persists nothing: relation count unchanged).
+    Then POST /complaints with:
+      institution = SYN-TN-0001; category FEES_REFUND; priority HIGH;
+      source_channel PORTAL; complainant_type STUDENT;
+      title "Tuition fee refund withheld after admission cancellation";
+      description "Complainant states that the college is withholding the refund of
+      tuition fees and hostel fees even after admission was cancelled within the
+      permitted period. Repeated requests to the accounts section have not been
+      answered."
+    -> 201; status REGISTERED; primary bureau PGRC; owner pgrc.official1; a status_history
+    row (null -> REGISTERED); audit COMPLAINT_CREATED.
+ 6. Response `related_candidates` contains (a) with score >= 40 (expected HIGH,
+    >= 60 with the given text; if your scorer yields lower, fix the scorer's text
+    handling, not the thresholds, and document it) and an explanation listing
+    category match, shared keywords/domain terms; complaint (b) is NOT a candidate.
+    A SUGGESTED relation row exists; owners of (a) and the new complaint received
+    RELATED_SUGGESTED notifications (rb.official1 has one unread).
+ 7. Review: as pgrc.official1 POST /relations/{id}/confirm {relation_type:
+    RELATED_ISSUE, note:"Same fee refund issue reported through PGRC",
+    add_participating_bureaus:true} -> 200; relation CONFIRMED with reviewer/time.
+    Both complaints remain separate rows with their own histories and unchanged
+    statuses. (Separate test covers the DISMISS branch on a seeded pair, plus a
+    second review attempt -> 409.)
+ 8. As rb.official1 GET /institutions/{id}/timeline -> events from both complaints in
+    chronological order including RELATION_CONFIRMED and PARTICIPANT_ADDED; RB now
+    has FULL access to the PGRC complaint (access_level FULL) and PGRC to (a).
+    Before confirmation the PGRC complaint's events appeared redacted to RB.
+ 9. Login as supervisor. GET complaint (a) and the new complaint: primary bureau RB
+    / PGRC respectively; participating bureaus = [PGRC] / [RB]. GET
+    /institutions/{id}/coordination shows both bureaus with open_as_primary = 1+
+    and multi_bureau_open = true.
+10. Capture GET /analytics/status-distribution (and /analytics/summary) as `before`.
+    As rb.official1 POST /complaints/{a}/status {to_status: ACTION_INITIATED,
+    remark: "Notice issued to institution", expected_status: UNDER_REVIEW} -> 200.
+    An invalid move REGISTERED->RESOLVED on the new complaint (by pgrc.official1)
+    -> 409 INVALID_STATUS_TRANSITION.
+11. Database verification (direct SQL in the test): complaints.status for (a) is
+    ACTION_INITIATED; status_history has a new row (UNDER_REVIEW -> ACTION_INITIATED,
+    changed_by rb.official1, remark stored); version incremented.
+12. Re-fetch analytics `after`: ACTION_INITIATED count +1 and UNDER_REVIEW count -1
+    (plus the new REGISTERED complaint counted in total/REGISTERED); values equal
+    independent SQL counts. Complaint (a) timeline/notifications show the change;
+    pgrc.official1 received STATUS_CHANGED.
+13. Audit: GET /audit-logs as admin includes, in order, COMPLAINT_CREATED,
+    RELATION_SUGGESTED, RELATION_CONFIRMED, ASSIGNMENT_PARTICIPANT_ADDED (x2),
+    COMPLAINT_STATUS_CHANGED with correct actors, entity ids, before/after, and
+    request_ids. Attempting UPDATE/DELETE on audit_logs via SQL raises.
+14. Run the overdue scan (POST /system/jobs/overdue-scan as supervisor). GET
+    /reports/overdue (supervisor) includes complaint (b) with days_overdue = 10 and
+    excludes (a) and the new complaint. rb.official2 (owner of b) has an OVERDUE
+    notification; running the scan again creates no duplicates.
+15. GET /reports/overdue/export.csv as supervisor -> 200, text/csv, header row as
+    in Section 13, rows equal the JSON report, includes (b); as pgrc.official1 the
+    same export contains only PGRC-participating complaints (not (b)); an audit row
+    REPORT_EXPORTED exists with the row count.
+16. Unauthorized operations are rejected by the backend (each asserted, each
+    producing an ACCESS_DENIED audit row with outcome DENIED):
+      - no token -> 401
+      - pgrc.official1 changes status of a complaint where PGRC does not participate -> 403
+      - pgrc.official1 (or rb.official1) closes a RESOLVED complaint -> 403
+      - rb.official1 transfers primary bureau -> 403
+      - admin changes complaint status -> 403
+      - rb.official1 GET /audit-logs, POST /users -> 403
+      - pgrc.official1 GET notes of a complaint it does not participate in -> 403
+      - a deactivated user's valid token -> 401
+Deliver a PASS/FAIL line per step in test output (use descriptive step names) and
+copy the actual result into docs/VERIFICATION_REPORT.md.
+
+================================================================================
+## 20. LOCAL SETUP AND EXECUTION INSTRUCTIONS
+================================================================================
+Create .env.example (root, plus backend/.env.example and frontend/.env.example if
+you split them) containing exactly these variables with safe defaults:
+  APP_ENV=development                       (development|test|production)
+  DATABASE_URL=postgresql+psycopg://aicte:aicte_dev_pw@localhost:5432/aicte_dashboard
+  TEST_DATABASE_URL=postgresql+psycopg://aicte:aicte_dev_pw@localhost:5432/aicte_dashboard_test
+  POSTGRES_USER=aicte  POSTGRES_PASSWORD=aicte_dev_pw  POSTGRES_DB=aicte_dashboard  POSTGRES_PORT=5432
+  SECRET_KEY=change-me-in-real-use          (app refuses this value in production)
+  ACCESS_TOKEN_EXPIRE_MINUTES=60
+  APP_TIMEZONE=Asia/Kolkata
+  FRONTEND_ORIGIN=http://localhost:5173
+  ENABLE_SCHEDULER=true
+  OVERDUE_SCAN_INTERVAL_MINUTES=15
+  DEMO_PASSWORD=Demo@12345
+  LOG_LEVEL=INFO
+  VITE_API_BASE_URL=http://localhost:8000/api/v1
+
+docker-compose.yml: service `db` (postgres:16, volume, healthcheck via pg_isready,
+env from .env). The test database must be creatable by the same user (document
+the exact SQL if automatic creation fails).
+
+README.md must contain EXACT, verified commands (Linux/macOS bash AND Windows
+PowerShell variants), prerequisites with versions, and these steps:
+  1. cp .env.example .env
+  2. docker compose up -d db          (fallback: local PostgreSQL commands:
+     createuser/createdb or psql statements to create user aicte and the two DBs)
+  3. cd backend; create venv; pip install -r requirements.txt -r requirements-dev.txt
+  4. alembic upgrade head
+  5. python -m app.cli seed
+  6. uvicorn app.main:app --reload --port 8000     (health: GET /api/v1/health)
+  7. cd frontend; npm install; npm run dev          (http://localhost:5173)
+  8. Tests: (backend) pytest -q --cov=app ; (frontend) npm run test -- --run ;
+     npm run typecheck ; npm run lint ; npm run build
+  9. Scenario against a live stack: E2E_BASE_URL=http://localhost:8000/api/v1
+     pytest tests/e2e -q
+Also provide Makefile targets (db-up, migrate, seed, backend, frontend, test,
+build, verify) and docs/TROUBLESHOOTING.md covering: port conflicts, Docker not
+running, DB connection refused, wrong DATABASE_URL driver, migration head
+mismatch, seed refusing to run, CORS errors, expired token loops, Windows path/
+venv activation issues, npm peer-dependency errors, and resetting the database
+(`python -m app.cli seed --reset`). Test every command you document; if one could
+not be run in your environment (e.g., Docker unavailable), say so explicitly in
+the README and the report rather than implying it works.
+
+================================================================================
+## 21. IMPLEMENTATION SEQUENCE (WORK INCREMENTALLY; GATE EACH PHASE)
+================================================================================
+Each phase ends by running its checks and fixing failures before moving on.
+Prioritize a working vertical slice (Phase 3) before breadth.
+
+Phase 0  Inspect workspace (Section 3); write IMPLEMENTATION_PLAN.md and DECISIONS.md.
+Phase 1  Scaffolding: repo layout, config, docker-compose db, .env.example, backend
+         app factory + /health, frontend Vite app + routing shell + Tailwind.
+         GATE: db up, /health/ready OK, `npm run build` OK.
+Phase 2  Database: SQLAlchemy models, Alembic migration 0001 with constraints,
+         indexes, append-only triggers, bureau reference rows.
+         GATE: migration upgrade/downgrade/upgrade passes; test_migrations passes.
+Phase 3  VERTICAL SLICE: auth (login, JWT, /me), permissions core, institutions list,
+         complaint create + detail + status change (with status_history + audit),
+         frontend login -> institutions -> create complaint -> change status.
+         Seed minimal data. GATE: manual + automated check that the flow persists.
+Phase 4  Full authorization: visibility/access_level, allowed_actions, matrix tests,
+         ACCESS_DENIED auditing, lockout, user management API + page.
+Phase 5  Complaint feature completeness: edit w/ versioning, notes, listing filters/
+         scopes, escalation, institution CRUD, timeline and coordination endpoints.
+Phase 6  Assignments: participants, owner change, primary transfer, history,
+         invariants + tests; frontend coordination UI.
+Phase 7  Duplicate/related detection: normalizer, scorer, persistence, preview,
+         review queue, confirm/dismiss/revert, auto-participation; tests; frontend
+         related UI with explanation cards.
+Phase 8  Notifications + overdue scan + scheduler + CLI; frontend bell/page; tests.
+Phase 9  Analytics + reports + CSV export; dashboard and reports pages; tests.
+Phase 10 Full seed generator (Section 16) via services; verify counts printed by seed.
+Phase 11 Frontend completion: every page/state in Section 14, Vitest suite,
+         accessibility pass, no dead controls (grep for TODO/placeholder handlers).
+Phase 12 Acceptance: run the Section 19 scenario in tests AND against the live
+         stack; run full backend + frontend test suites, typecheck, lint, build;
+         fix every defect found; rerun until green or documented.
+Phase 13 Documentation: README, ARCHITECTURE (include Mermaid diagrams for system
+         architecture, ER, complaint lifecycle, cross-bureau workflow, duplicate
+         detection), API.md, TROUBLESHOOTING, VERIFICATION_REPORT.
+
+OPTIONAL ENHANCEMENTS (only after Definition of Done is met): attachments,
+Playwright browser E2E, relation graph visualization, primary-transfer request/
+approval flow, email adapter stub wiring, Excel export, dark mode, i18n,
+full-stack Docker images.
+
+================================================================================
+## 22. DEFINITION OF DONE
+================================================================================
+All must be true AND demonstrated by commands you actually ran:
+[ ] Fresh clone setup following README works: db up, migrate, seed, backend,
+    frontend all start (or documented environment limitation with fallback tested).
+[ ] Alembic upgrade head / downgrade base / upgrade head succeed.
+[ ] Seed produces the Section 16 volume and the scenario fixture; re-running without
+    --reset is refused safely; --reset works.
+[ ] All six demo accounts can log in; each role sees only what the matrix permits.
+[ ] Backend enforces every row of the permission matrix (tests prove it).
+[ ] Complaint create/edit/assign/status/notes/escalation/relations persist in
+    PostgreSQL and survive restart; histories and audit rows exist.
+[ ] Related-complaint detection is deterministic, explainable, reviewable; no
+    auto-merge; complaints remain separate; dismissed pairs stay dismissed.
+[ ] Dashboard/analytics/reports numbers equal independent SQL counts; CSV export
+    matches JSON and honors scope.
+[ ] Notifications and overdue scan work and are idempotent.
+[ ] audit_logs and status_history reject UPDATE/DELETE at the database level.
+[ ] Every frontend page in Section 14 exists, is wired to real endpoints, and
+    implements loading/empty/error/validation/success states; no hardcoded stats,
+    fake buttons, or fake success messages.
+[ ] Backend pytest suite passes; frontend Vitest suite passes; typecheck, lint,
+    and `npm run build` pass. Failures are fixed, not hidden or skipped
+    (any skipped/xfailed test must be listed with a reason).
+[ ] Section 19 scenario passes in-process and against the live server.
+[ ] README, ARCHITECTURE (with diagrams), DECISIONS, API, TROUBLESHOOTING, and
+    VERIFICATION_REPORT are complete and accurate.
+
+================================================================================
+## 23. FINAL VERIFICATION AND IMPLEMENTATION REPORT
+================================================================================
+Finish by writing docs/VERIFICATION_REPORT.md and replying with the same content:
+1. Environment: OS, Python/Node/Docker/PostgreSQL versions actually used.
+2. Commands executed with real outcomes: migrate, seed (printed counts), backend
+   start, frontend build, each test command with pass/fail/skip counts and exit
+   codes, coverage percentage, typecheck/lint results.
+3. Section 19 scenario: PASS/FAIL for each of the 16 steps (in-process and live).
+4. Manual/browser smoke-test notes if performed (pages visited, observations).
+5. Defects found during testing and how they were fixed.
+6. Deviations from this specification and why (cross-check docs/DECISIONS.md).
+7. Known limitations (e.g., sessionStorage token, no MFA, no real AICTE integration,
+   simple stemmer, English-only text matching, single-process scheduler).
+8. Remaining tasks / optional enhancements not done.
+9. Exact commands for another developer to run, test, and verify.
+If any required item could not be completed or verified, say precisely which and
+why. Never mark an item done that you did not verify. Do not stop until Section 22
+is satisfied or you have clearly reported what blocks it.
+################################################################################
+# END OF MASTER PROMPT
+################################################################################
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-10-24T18:05:13+05:30.
+</ADDITIONAL_METADATA>
+<USER_SETTINGS_CHANGE>
+The user changed setting `Model Selection` from None to Claude Opus 4.6 (Thinking). No need to comment on this change if the user doesn't ask about it. If reporting what model you are, please use a human readable name instead of the exact string.
+</USER_SETTINGS_CHANGE>
